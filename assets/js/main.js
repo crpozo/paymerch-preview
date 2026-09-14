@@ -107,6 +107,7 @@
 	/* 5. Transfer calculator + Wise-style currency picker inside the phone screens. */
 	var money = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 	var SVG_NS = 'http://www.w3.org/2000/svg';
+	var liveRates = null;   // shared by both calculators once fetched
 
 	function toNumber(str) {
 		var clean = String(str).replace(/[^0-9.]/g, '');
@@ -115,11 +116,10 @@
 		var n = parseFloat(clean);
 		return isFinite(n) ? n : 0;
 	}
-	function byCode(list, code) {
-		for (var i = 0; i < list.length; i++) {
-			if (list[i].code === code) { return list[i]; }
-		}
-		return null;
+	function fmtRate(r) {
+		if (r >= 100) { return money.format(r); }
+		if (r >= 1) { return r.toFixed(4).replace(/0+$/, '').replace(/\.$/, '.00'); }
+		return r.toPrecision(4);
 	}
 	function checkIcon() {
 		var svg = document.createElementNS(SVG_NS, 'svg');
@@ -136,110 +136,125 @@
 		svg.appendChild(path);
 		return svg;
 	}
+	function fetchLiveRates(url, done) {
+		if (!url || !window.fetch || liveRates) { if (liveRates) { done(liveRates); } return; }
+		fetch(url).then(function (r) { return r.json(); }).then(function (data) {
+			if (data && data.rates) { liveRates = data.rates; done(liveRates); }
+		}).catch(function () { /* keep server-side rates */ });
+	}
 
 	document.querySelectorAll('[data-calc]').forEach(function (calc) {
 		var data = JSON.parse(calc.getAttribute('data-currencies') || '{}');
-		if (!data.send || !data.receive || !data.receive.length) { return; }
+		if (!data.currencies || !data.currencies.length) { return; }
 
-		var fee = parseFloat(calc.getAttribute('data-fee')) || 0;
+		var byCode = {};
+		data.currencies.forEach(function (c) { byCode[c.code] = c; });
+		var feeUSD = parseFloat(calc.getAttribute('data-fee')) || 0;
 		var send = calc.querySelector('[data-calc-send]');
 		var receive = calc.querySelector('[data-calc-receive]');
 		var rateText = calc.querySelector('[data-calc-rate]');
+		var feeTexts = calc.querySelectorAll('[data-calc-fee]');
 		var picker = calc.querySelector('[data-picker]');
 		var search = picker.querySelector('[data-picker-search]');
 		var list = picker.querySelector('[data-picker-list]');
 		var empty = picker.querySelector('[data-picker-empty]');
-		var group = picker.querySelector('[data-picker-group]');
+		var scroller = list.parentNode;
 		var MAX_SEND = 999999.99;
-		var state = { send: data.send[0].code, receive: data.receive[0].code };
+		var state = { send: data.send, receive: data.receive };
 		var side = null;
 		var trigger = null;
-		var visible = [];
+		var options = [];   // visible option elements in order
 		var active = -1;
 
-		function rate() {
-			var c = byCode(data.receive, state.receive);
-			return c ? c.rate : 0;
-		}
+		function rate() { return byCode[state.receive].rate / byCode[state.send].rate; }
+		function feeInSend() { return feeUSD * byCode[state.send].rate; }
 		/* Shrink long numbers so they never collide with the currency pill. */
 		function fit(input) {
 			input.style.setProperty('--amt-fit', Math.min(1, 8.6 / Math.max(input.value.length, 1)).toFixed(3));
 		}
 		function fromSend() {
 			var s = Math.min(toNumber(send.value), MAX_SEND);
-			receive.value = money.format(Math.max(0, s - fee) * rate());
+			receive.value = money.format(Math.max(0, s - feeInSend()) * rate());
 			fit(send); fit(receive);
 		}
 		function fromReceive() {
 			var r = toNumber(receive.value);
-			var s = r > 0 && rate() > 0 ? r / rate() + fee : 0;
+			var s = r > 0 ? r / rate() + feeInSend() : 0;
 			send.value = money.format(Math.min(s, MAX_SEND));
 			fit(send); fit(receive);
 		}
-
-		function updatePill(which) {
-			var c = byCode(data[which], state[which]);
-			var btn = calc.querySelector('[data-picker-open="' + which + '"]');
-			if (!c || !btn) { return; }
-			btn.querySelector('[data-pill-flag]').src = c.flag;
-			btn.querySelector('[data-pill-code]').textContent = c.code;
+		function paint() {
+			rateText.textContent = '1 ' + state.send + ' = ' + fmtRate(rate()) + ' ' + state.receive;
+			var f = feeInSend();
+			feeTexts.forEach(function (el) {
+				var usd = state.send === 'USD';
+				el.textContent = (usd ? '$' : '') + money.format(f) + (!usd && el.getAttribute('data-calc-fee') !== 'short' ? ' ' + state.send : '');
+			});
+			['send', 'receive'].forEach(function (which) {
+				var c = byCode[state[which]];
+				var btn = calc.querySelector('[data-picker-open="' + which + '"]');
+				btn.querySelector('[data-pill-flag]').src = c.flag;
+				btn.querySelector('[data-pill-code]').textContent = c.code;
+			});
+			fromSend();
 		}
+
 		function setActive(i) {
-			var items = list.children;
 			active = i;
-			for (var k = 0; k < items.length; k++) { items[k].classList.toggle('is-active', k === i); }
-			if (i < 0 || !items[i]) {
-				search.removeAttribute('aria-activedescendant');
-				return;
-			}
-			search.setAttribute('aria-activedescendant', items[i].id);
-			var top = items[i].offsetTop;
-			var bottom = top + items[i].offsetHeight;
-			if (top < list.scrollTop) { list.scrollTop = top; }
-			else if (bottom > list.scrollTop + list.clientHeight) { list.scrollTop = bottom - list.clientHeight; }
+			options.forEach(function (li, k) { li.classList.toggle('is-active', k === i); });
+			if (i < 0 || !options[i]) { search.removeAttribute('aria-activedescendant'); return; }
+			search.setAttribute('aria-activedescendant', options[i].id);
+			var top = options[i].offsetTop - list.offsetTop;
+			var bottom = top + options[i].offsetHeight;
+			if (top < scroller.scrollTop) { scroller.scrollTop = top; }
+			else if (bottom > scroller.scrollTop + scroller.clientHeight) { scroller.scrollTop = bottom - scroller.clientHeight; }
+		}
+		function option(c) {
+			var li = document.createElement('li');
+			li.id = picker.id + '-' + c.code;
+			li.className = 'pm-picker__opt';
+			li.setAttribute('role', 'option');
+			var selected = c.code === state[side];
+			li.setAttribute('aria-selected', selected ? 'true' : 'false');
+			var img = document.createElement('img');
+			img.src = c.flag; img.alt = ''; img.width = 80; img.height = 60; img.loading = 'lazy';
+			var code = document.createElement('span'); code.className = 'pm-picker__code'; code.textContent = c.code;
+			var name = document.createElement('span'); name.className = 'pm-picker__name'; name.textContent = c.name;
+			li.appendChild(img); li.appendChild(code); li.appendChild(name);
+			if (selected) { li.appendChild(checkIcon()); }
+			li.addEventListener('click', function () { choose(c.code); });
+			li.addEventListener('mousemove', function () { var k = options.indexOf(li); if (k !== active) { setActive(k); } });
+			return li;
+		}
+		function heading(text) {
+			var li = document.createElement('li');
+			li.className = 'pm-picker__group';
+			li.setAttribute('role', 'presentation');
+			li.textContent = text;
+			return li;
 		}
 		function render() {
 			var q = search.value.trim().toLowerCase();
-			var selected = 0;
-			visible = data[side].filter(function (c) {
-				return !q || (c.code + ' ' + c.name + ' ' + c.country).toLowerCase().indexOf(q) > -1;
-			});
+			var match = function (c) { return !q || (c.code + ' ' + c.name + ' ' + c.country).toLowerCase().indexOf(q) > -1; };
 			list.textContent = '';
-			visible.forEach(function (c, i) {
-				var isSelected = c.code === state[side];
-				if (isSelected) { selected = i; }
-				var li = document.createElement('li');
-				li.id = picker.id + '-' + c.code;
-				li.className = 'pm-picker__opt';
-				li.setAttribute('role', 'option');
-				li.setAttribute('aria-selected', isSelected ? 'true' : 'false');
-				var img = document.createElement('img');
-				img.src = c.flag;
-				img.alt = '';
-				img.width = 40;
-				img.height = 40;
-				var code = document.createElement('span');
-				code.className = 'pm-picker__code';
-				code.textContent = c.code;
-				var name = document.createElement('span');
-				name.className = 'pm-picker__name';
-				name.textContent = c.name;
-				li.appendChild(img);
-				li.appendChild(code);
-				li.appendChild(name);
-				if (isSelected) { li.appendChild(checkIcon()); }
-				li.addEventListener('click', function () { choose(c.code); });
-				li.addEventListener('mouseenter', function () { setActive(i); });
-				list.appendChild(li);
-			});
-			empty.hidden = visible.length > 0;
-			setActive(visible.length ? (q ? 0 : selected) : -1);
+			options = [];
+			var popular = data.popular.map(function (code) { return byCode[code]; }).filter(function (c) { return c && match(c); });
+			var all = data.currencies.filter(match);
+			if (!q && popular.length) {
+				list.appendChild(heading(list.getAttribute('data-popular')));
+				popular.forEach(function (c) { var li = option(c); options.push(li); list.appendChild(li); });
+				list.appendChild(heading(list.getAttribute('data-all')));
+			}
+			all.forEach(function (c) { var li = option(c); options.push(li); list.appendChild(li); });
+			empty.hidden = options.length > 0;
+			var selectedIndex = 0;
+			options.some(function (li, k) { if (li.getAttribute('aria-selected') === 'true') { selectedIndex = k; return true; } return false; });
+			scroller.scrollTop = 0;
+			setActive(options.length ? (q ? 0 : selectedIndex) : -1);
 		}
 		function openPicker(which, btn) {
 			if (side) { closePicker(false); }
-			side = which;
-			trigger = btn;
-			group.textContent = group.getAttribute(which === 'send' ? 'data-send' : 'data-receive');
+			side = which; trigger = btn;
 			search.value = '';
 			picker.hidden = false;
 			calc.classList.add('is-picking');
@@ -257,13 +272,10 @@
 		}
 		function choose(code) {
 			var which = side;
+			if (which === 'send' && code === state.receive) { state.receive = state.send; }
+			else if (which === 'receive' && code === state.send) { state.send = state.receive; }
 			state[which] = code;
-			updatePill(which);
-			if (which === 'receive') {
-				var c = byCode(data.receive, code);
-				rateText.textContent = '1 USD = ' + money.format(c.rate) + ' ' + c.code;
-				fromSend();
-			}
+			paint();
 			closePicker();
 		}
 
@@ -282,10 +294,10 @@
 		});
 		search.addEventListener('input', render);
 		search.addEventListener('keydown', function (e) {
-			if (!visible.length) { return; }
-			if (e.key === 'ArrowDown') { e.preventDefault(); setActive((active + 1) % visible.length); }
-			else if (e.key === 'ArrowUp') { e.preventDefault(); setActive((active - 1 + visible.length) % visible.length); }
-			else if (e.key === 'Enter' && active > -1) { e.preventDefault(); choose(visible[active].code); }
+			if (!options.length) { return; }
+			if (e.key === 'ArrowDown') { e.preventDefault(); setActive((active + 1) % options.length); }
+			else if (e.key === 'ArrowUp') { e.preventDefault(); setActive((active - 1 + options.length) % options.length); }
+			else if (e.key === 'Enter' && active > -1) { e.preventDefault(); options[active].click(); }
 		});
 
 		send.addEventListener('input', fromSend);
@@ -295,8 +307,16 @@
 			el.addEventListener('blur', function () { el.value = money.format(toNumber(el.value)); fit(el); });
 			el.addEventListener('keydown', function (e) { if (e.key === 'Enter') { el.blur(); } });
 		});
-		fit(send);
-		fit(receive);
+		fit(send); fit(receive);
+
+		/* Refresh with live mid-market rates when the feed is reachable. */
+		fetchLiveRates(data.feed, function (rates) {
+			var changed = false;
+			data.currencies.forEach(function (c) {
+				if (rates[c.code] > 0 && !c.locked) { c.rate = rates[c.code]; changed = true; }
+			});
+			if (changed) { paint(); }
+		});
 	});
 
 	/* 6. Legal pages: collapse the "On this page" index on small screens. */
